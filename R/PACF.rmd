@@ -1,0 +1,418 @@
+---
+title: "PACF"
+output: html_notebook
+---
+
+
+```{r}
+library(arrow)
+library(dplyr)      
+library(ggplot2)     
+library(lubridate) 
+library(tidyr)  
+library(patchwork)
+library(corrplot)
+library(sp)          # spatial objects
+library(spacetime)   # space-time data classes
+library(gstat)       # variograms, kriging
+library(sf)
+library(terra)
+library(ggrepel)
+library(automap)
+library(viridis)
+library(viridisLite)
+```
+
+```{r}
+### PREPROCESSING
+
+# --- 1. Read and clean data ---
+df_anom <- read_parquet("df_illgraben_anomaly_scores.parquet")
+coords <- read.delim("coords.txt", sep = "|", comment.char = "#", 
+                     header = FALSE, stringsAsFactors = FALSE)
+
+col_names <- c("Network","Station","Location","Channel","Latitude","Longitude","Elevation",
+               "Depth","Azimuth","Dip","SensorDescription","Scale","ScaleFreq",
+               "ScaleUnits","SampleRate","StartTime","EndTime")
+coords <- coords[-1, ]
+names(coords) <- col_names
+
+coords <- coords %>%
+  mutate(Latitude = as.numeric(Latitude),
+         Longitude = as.numeric(Longitude),
+         Elevation = as.numeric(Elevation)) %>%
+  arrange(Station, desc(StartTime)) %>%
+  group_by(Station) %>% slice(1) %>% ungroup() %>%
+  select(Station, Latitude, Longitude, Elevation)
+
+# Convert to MN95/LV95
+stations_sf <- st_as_sf(coords, coords = c("Longitude","Latitude"), crs = 4326) %>%
+  st_transform(2056) %>%
+  mutate(X_mn95 = st_coordinates(.)[,1],
+         Y_mn95 = st_coordinates(.)[,2]) %>%
+  st_drop_geometry() %>%
+  select(Station, X_mn95, Y_mn95, Elevation)
+
+# Merge coordinates with anomaly data
+df_anom_coords <- df_anom %>%
+  left_join(stations_sf, by = c("station" = "Station")) %>%
+  filter(!is.na(X_mn95) & !is.na(Y_mn95))
+
+```
+
+
+```{r}
+# Sort by station and time
+df_anom_coords <- df_anom_coords %>%
+  arrange(station, time)
+```
+
+
+
+```{r}
+df_focused <- df_anom_coords %>%
+  mutate(time = as.POSIXct(time)) %>%   # ensure POSIXct type
+  filter(time >= as.POSIXct("2022-07-01 00:00:00", tz = "UTC") &
+         time < as.POSIXct("2022-08-31 23:59:59", tz = "UTC"))
+
+# function to get cutoff for one station
+get_pacf_cutoff <- function(anomaly_scores) {
+  n <- length(anomaly_scores)
+  if (n < 100) return(NA)
+  
+  # Compute PACF
+  # maximum is minimum between 1000lags and number of anomaly scores/2
+  pacf_result <- pacf(anomaly_scores, lag.max = min(1000, n / 2), plot = TRUE)
+  pacf_values <- as.numeric(pacf_result$acf)
+  
+  # Significance threshold (95% CI for PACF)
+  threshold <- 2 / sqrt(n)
+  
+  # Find first lag where PACF falls inside confidence bounds
+  # skip the first PACF value (pacf_values[-1]) because: pacf_values[1] is lag 1, which is always significant
+  below_threshold <- which(abs(pacf_values[-1]) < threshold)
+  
+  if (length(below_threshold) > 0) {
+    return(below_threshold[1])
+  } else {
+    return(length(pacf_values))  # max lag if it never drops below
+  }
+}
+
+# Apply to stations
+cutoffs <- sapply(unique(df_focused$station), function(stn) {
+  scores <- df_focused %>%
+    filter(station == stn) %>%
+    pull(anomaly_score) %>%
+    na.omit()
+  get_pacf_cutoff(scores)
+})
+
+
+# Convert to time units (50-second intervals)
+cutoff_minutes <- cutoffs * 50 / 60
+cutoff_hours <- cutoffs * 50 / 3600
+
+# Results
+results <- data.frame(
+  Station = names(cutoffs),
+  Lags = cutoffs,
+  Minutes = round(cutoff_minutes, 1),
+  Hours = round(cutoff_hours, 2)
+)
+
+print(results)
+cat("\ TEMPORAL CUTOFF VALUES:\n")
+cat("Median:", median(cutoff_minutes, na.rm = TRUE), "minutes\n")
+cat("Mean:", mean(cutoff_minutes, na.rm = TRUE), "minutes\n")
+```
+
+```{r}
+#bin to 10 min intervals
+df_anom_binned <- df_anom_coords %>%
+  mutate(time_bin = floor_date(time, "10 minutes")) %>%
+  group_by(time_bin, station) %>%
+  summarise(
+    anomaly_score = mean(anomaly_score, na.rm = TRUE),
+    X_mn95 = first(X_mn95),
+    Y_mn95 = first(Y_mn95),
+    .groups = "drop"
+  ) %>%
+  arrange(station, time_bin)  # chronological order
+
+cat(sprintf("Original data: %s observations\n", format(nrow(df_anom_coords), big.mark = ",")))
+cat(sprintf("Binned data: %s observations\n\n", format(nrow(df_anom_binned), big.mark = ",")))
+
+# function for pacf cutoff for one station
+get_pacf_cutoff <- function(anomaly_scores, station_name = "") {
+  n <- length(anomaly_scores)
+  if (n < 100) return(NA)
+  
+  # each lag represents 10 minutes 
+  pacf_result <- pacf(anomaly_scores, 
+                      lag.max = min(1000, floor(n / 2)), 
+                      plot = TRUE,
+                      main = paste("PACF -", station_name, "(10-min bins)"))
+  
+  pacf_values <- as.numeric(pacf_result$acf)
+  
+  # significance threshold
+  threshold <- 2 / sqrt(n)
+  
+  # threshold lines to plot
+  abline(h = c(threshold, -threshold), col = "red", lty = 2, lwd = 2)
+  
+  # where PACF drops below threshold
+  below_threshold <- which(abs(pacf_values) < threshold)
+  
+  # cutoff and add to plot
+  if (length(below_threshold) > 0) {
+    cutoff <- below_threshold[1]
+    abline(v = cutoff, col = "blue", lty = 2, lwd = 2)
+    legend("topright", 
+           legend = c("95% CI", paste("Cutoff:", cutoff, "lags")),
+           col = c("red", "blue"), 
+           lty = 2, 
+           cex = 0.8, 
+           bty = "n")
+    return(cutoff)
+  } else {
+    abline(v = length(pacf_values), col = "orange", lty = 2, lwd = 2)
+    legend("topright", 
+           legend = c("95% CI", "Max lag (still significant!)"),
+           col = c("red", "orange"), 
+           lty = 2, 
+           cex = 0.8, 
+           bty = "n")
+    return(length(pacf_values))
+  }
+}
+
+# apply to all stations
+par(mfrow = c(3, 3))  # 3x3 grid for 8 stations
+
+cutoffs <- sapply(unique(df_anom_binned$station), function(stn) {
+  # Extract binned anomaly scores for this station
+  scores <- df_anom_binned %>%
+    filter(station == stn) %>%
+    pull(anomaly_score) %>%
+    na.omit()
+  
+  # Call function with station name
+  get_pacf_cutoff(scores, station_name = stn)
+})
+
+par(mfrow = c(1, 1))  # Reset plotting
+
+
+# Each lag = 10 minutes (due to binning)
+cutoff_minutes <- cutoffs * 10      # 10 min/lag
+cutoff_hours <- cutoffs * 10 / 60   # Convert to hours
+
+#summary
+results <- data.frame(
+  Station = names(cutoffs),
+  Lags = cutoffs,
+  Minutes = round(cutoff_minutes, 1),
+  Hours = round(cutoff_hours, 2)
+)
+
+cat("\n=== RESULTS TABLE ===\n")
+print(results)
+
+
+cat("\n=== TEMPORAL CUTOFF VALUES (10-MINUTE BINS) ===\n")
+cat(sprintf("Median: %d lags = %.1f minutes = %.2f hours\n", 
+            round(median(cutoffs, na.rm = TRUE)),
+            median(cutoff_minutes, na.rm = TRUE),
+            median(cutoff_hours, na.rm = TRUE)))
+cat(sprintf("Mean:   %d lags = %.1f minutes = %.2f hours\n", 
+            round(mean(cutoffs, na.rm = TRUE)),
+            mean(cutoff_minutes, na.rm = TRUE),
+            mean(cutoff_hours, na.rm = TRUE)))
+cat(sprintf("Min:    %d lags = %.1f minutes = %.2f hours\n", 
+            min(cutoffs, na.rm = TRUE),
+            min(cutoff_minutes, na.rm = TRUE),
+            min(cutoff_hours, na.rm = TRUE)))
+cat(sprintf("Max:    %d lags = %.1f minutes = %.2f hours\n", 
+            max(cutoffs, na.rm = TRUE),
+            max(cutoff_minutes, na.rm = TRUE),
+            max(cutoff_hours, na.rm = TRUE)))
+
+
+cat("\n=== INTERPRETATION ===\n")
+cat("Each lag now represents a 10-minute interval (after binning).\n")
+cat("The cutoff shows how far back in time observations remain correlated.\n")
+cat("Use this value as the temporal cutoff for your spatiotemporal variogram.\n")
+```
+```{r}
+### COMPUTING INTER-STATION DISTANCES
+# ==================================
+
+# Get unique station coordinates
+station_coords <- df_anom_coords %>%
+  select(station, X_mn95, Y_mn95) %>%
+  distinct()
+
+# Check we have all stations
+cat(sprintf("Number of stations: %d\n", nrow(station_coords)))
+print(station_coords)
+
+# Create distance matrix
+# =====================
+n_stations <- nrow(station_coords)
+dist_matrix <- matrix(0, nrow = n_stations, ncol = n_stations)
+rownames(dist_matrix) <- station_coords$station
+colnames(dist_matrix) <- station_coords$station
+
+# Calculate pairwise distances
+for(i in 1:n_stations) {
+  for(j in 1:n_stations) {
+    if(i != j) {
+      dist_matrix[i, j] <- sqrt(
+        (station_coords$X_mn95[i] - station_coords$X_mn95[j])^2 + 
+        (station_coords$Y_mn95[i] - station_coords$Y_mn95[j])^2
+      )
+    }
+  }
+}
+
+# Display distance matrix
+cat("\n=== DISTANCE MATRIX (meters) ===\n")
+print(round(dist_matrix, 1))
+
+# Extract unique pairwise distances (upper triangle, excluding diagonal)
+pairwise_distances <- dist_matrix[upper.tri(dist_matrix)]
+
+# Summary statistics
+cat("\n=== INTER-STATION DISTANCE STATISTICS ===\n")
+cat(sprintf("Maximum distance:  %.1f meters (%.2f km)\n", 
+            max(pairwise_distances), 
+            max(pairwise_distances) / 1000))
+cat(sprintf("Minimum distance:  %.1f meters (%.2f km)\n", 
+            min(pairwise_distances), 
+            min(pairwise_distances) / 1000))
+cat(sprintf("Average distance:  %.1f meters (%.2f km)\n", 
+            mean(pairwise_distances), 
+            mean(pairwise_distances) / 1000))
+cat(sprintf("Median distance:   %.1f meters (%.2f km)\n", 
+            median(pairwise_distances), 
+            median(pairwise_distances) / 1000))
+cat(sprintf("Std deviation:     %.1f meters\n", sd(pairwise_distances)))
+
+# Find which stations are farthest apart
+max_dist_idx <- which(dist_matrix == max(pairwise_distances), arr.ind = TRUE)[1, ]
+cat(sprintf("\nFarthest pair: %s ↔ %s (%.1f m)\n",
+            rownames(dist_matrix)[max_dist_idx[1]],
+            colnames(dist_matrix)[max_dist_idx[2]],
+            max(pairwise_distances)))
+
+# Find which stations are closest
+min_dist_idx <- which(dist_matrix == min(pairwise_distances[pairwise_distances > 0]), 
+                      arr.ind = TRUE)[1, ]
+cat(sprintf("Closest pair: %s ↔ %s (%.1f m)\n",
+            rownames(dist_matrix)[min_dist_idx[1]],
+            colnames(dist_matrix)[min_dist_idx[2]],
+            min(pairwise_distances)))
+
+# Distribution of distances
+cat("\n=== DISTANCE DISTRIBUTION ===\n")
+cat(sprintf("Number of station pairs: %d\n", length(pairwise_distances)))
+dist_summary <- quantile(pairwise_distances, probs = c(0.25, 0.5, 0.75))
+cat(sprintf("25th percentile: %.1f m\n", dist_summary[1]))
+cat(sprintf("50th percentile: %.1f m\n", dist_summary[2]))
+cat(sprintf("75th percentile: %.1f m\n", dist_summary[3]))
+
+# Visualize station locations and distances
+# =========================================
+library(ggplot2)
+
+# Plot 1: Station map with labels
+p1 <- ggplot(station_coords, aes(x = X_mn95, y = Y_mn95)) +
+  geom_point(size = 4, color = "red") +
+  geom_text(aes(label = station), vjust = -1, size = 4) +
+  coord_equal() +
+  labs(
+    title = "Station Locations (MN95/LV95 Coordinates)",
+    x = "X (m)",
+    y = "Y (m)"
+  ) +
+  theme_minimal()
+
+print(p1)
+
+# Plot 2: Distance distribution histogram
+p2 <- ggplot(data.frame(distance = pairwise_distances), 
+             aes(x = distance)) +
+  geom_histogram(bins = 20, fill = "steelblue", color = "black", alpha = 0.7) +
+  geom_vline(xintercept = mean(pairwise_distances), 
+             color = "red", linetype = "dashed", linewidth = 1) +
+  geom_vline(xintercept = median(pairwise_distances), 
+             color = "blue", linetype = "dashed", linewidth = 1) +
+  annotate("text", x = mean(pairwise_distances), y = Inf, 
+           label = paste("Mean:", round(mean(pairwise_distances), 1), "m"),
+           vjust = 2, hjust = -0.1, color = "red") +
+  annotate("text", x = median(pairwise_distances), y = Inf, 
+           label = paste("Median:", round(median(pairwise_distances), 1), "m"),
+           vjust = 4, hjust = -0.1, color = "blue") +
+  labs(
+    title = "Distribution of Inter-Station Distances",
+    x = "Distance (m)",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+print(p2)
+
+# Plot 3: Network visualization with connections
+library(ggplot2)
+
+# Create data frame of all pairwise connections
+connections <- data.frame()
+for(i in 1:(n_stations-1)) {
+  for(j in (i+1):n_stations) {
+    connections <- rbind(connections, data.frame(
+      x1 = station_coords$X_mn95[i],
+      y1 = station_coords$Y_mn95[i],
+      x2 = station_coords$X_mn95[j],
+      y2 = station_coords$Y_mn95[j],
+      station1 = station_coords$station[i],
+      station2 = station_coords$station[j],
+      distance = dist_matrix[i, j]
+    ))
+  }
+}
+
+p3 <- ggplot() +
+  geom_segment(data = connections, 
+               aes(x = x1, y = y1, xend = x2, yend = y2, color = distance),
+               alpha = 0.5, linewidth = 0.8) +
+  geom_point(data = station_coords, 
+             aes(x = X_mn95, y = Y_mn95), 
+             size = 5, color = "black", shape = 21, fill = "white") +
+  geom_text(data = station_coords,
+            aes(x = X_mn95, y = Y_mn95, label = station),
+            size = 3, fontface = "bold") +
+  scale_color_gradient(low = "green", high = "red", name = "Distance (m)") +
+  coord_equal() +
+  labs(
+    title = "Station Network - All Pairwise Connections",
+    subtitle = paste("Max distance:", round(max(pairwise_distances), 1), "m |",
+                    "Mean distance:", round(mean(pairwise_distances), 1), "m"),
+    x = "X (m)",
+    y = "Y (m)"
+  ) +
+  theme_minimal()
+
+print(p3)
+
+# RECOMMENDATION FOR SPATIAL CUTOFF
+# =================================
+cat("\n=== RECOMMENDATION FOR VARIOGRAM ===\n")
+cat(sprintf("For spatial cutoff, consider using:\n"))
+cat(sprintf("  - Conservative: %.0f m (max distance)\n", max(pairwise_distances)))
+cat(sprintf("  - Moderate: %.0f m (75th percentile)\n", dist_summary[3]))
+cat(sprintf("  - Liberal: %.0f m (1.5 × max distance for extrapolation)\n", 
+            1.5 * max(pairwise_distances)))
+```
+

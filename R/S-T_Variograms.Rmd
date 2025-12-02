@@ -1,0 +1,1122 @@
+---
+title: "S-T_Variograms"
+output: html_document
+---
+
+```{r}
+library(arrow)
+library(dplyr)      
+library(ggplot2)     
+library(lubridate) 
+library(tidyr)  
+library(patchwork)
+library(corrplot)
+library(sp)          # spatial objects
+library(spacetime)   # space-time data classes
+library(gstat)       # variograms, kriging
+library(sf)
+library(terra)
+library(ggrepel)
+library(automap)
+library(viridis)
+library(viridisLite)
+```
+
+ALL PREPROCESSING DONE IN ONE CHUNK
+```{r}
+### PREPROCESSING
+
+# --- 1. Read and clean data ---
+df_anom <- read_parquet("df_illgraben_anomaly_scores.parquet")
+coords <- read.delim("coords.txt", sep = "|", comment.char = "#", 
+                     header = FALSE, stringsAsFactors = FALSE)
+
+col_names <- c("Network","Station","Location","Channel","Latitude","Longitude","Elevation",
+               "Depth","Azimuth","Dip","SensorDescription","Scale","ScaleFreq",
+               "ScaleUnits","SampleRate","StartTime","EndTime")
+coords <- coords[-1, ]
+names(coords) <- col_names
+
+coords <- coords %>%
+  mutate(Latitude = as.numeric(Latitude),
+         Longitude = as.numeric(Longitude),
+         Elevation = as.numeric(Elevation)) %>%
+  arrange(Station, desc(StartTime)) %>%
+  group_by(Station) %>% slice(1) %>% ungroup() %>%
+  select(Station, Latitude, Longitude, Elevation)
+
+# Convert to MN95/LV95
+stations_sf <- st_as_sf(coords, coords = c("Longitude","Latitude"), crs = 4326) %>%
+  st_transform(2056) %>%
+  mutate(X_mn95 = st_coordinates(.)[,1],
+         Y_mn95 = st_coordinates(.)[,2]) %>%
+  st_drop_geometry() %>%
+  select(Station, X_mn95, Y_mn95, Elevation)
+
+# Merge coordinates with anomaly data
+df_anom_coords <- df_anom %>%
+  left_join(stations_sf, by = c("station" = "Station")) %>%
+  filter(!is.na(X_mn95) & !is.na(Y_mn95))
+
+# Bin time to 1-min intervals
+df_anom_binned <- df_anom_coords %>%
+  mutate(time_bin = floor_date(time, "1 minute")) %>%
+  group_by(time_bin, station) %>%
+  summarise(
+    anomaly_score = mean(anomaly_score, na.rm = TRUE),
+    X_mn95 = first(X_mn95),
+    Y_mn95 = first(Y_mn95),
+    .groups = "drop"
+  )
+
+cat("Number of binned observations:", nrow(df_anom_binned), "\n")
+
+```
+
+
+```{r}
+# Filter the focused time window
+df_focused <- df_anom_binned %>%
+  filter(time_bin >= as.POSIXct("2020-06-04") & 
+         time_bin < as.POSIXct("2020-06-18"))
+
+cat("Focused dataset:", nrow(df_focused), "observations\n")
+
+# Keep only stations with complete data
+complete_stations <- df_focused %>%
+  group_by(station) %>%
+  summarise(n_obs = n()) %>%
+  filter(n_obs == length(unique(df_focused$time_bin))) %>%
+  pull(station)
+
+df_complete <- df_focused %>%
+  filter(station %in% complete_stations)
+
+cat("Stations with complete data:", length(complete_stations), "\n")
+cat("Rows after filtering:", nrow(df_complete), "\n")
+
+# Make one SpatialPoints per station
+unique_stations <- df_complete %>%
+  distinct(station, X_mn95, Y_mn95) %>%
+  arrange(station)
+
+sp_unique <- SpatialPoints(
+  coords = unique_stations[, c("X_mn95", "Y_mn95")],
+  proj4string = CRS("+proj=somerc +lat_0=46.9524055555556 +lon_0=7.43958333333333 +k_0=1 +x_0=2600000 +y_0=1200000 +ellps=bessel +units=m +no_defs")
+)
+
+# Prepare time vector
+time_vec <- sort(unique(df_complete$time_bin))
+```
+
+
+```{r}
+### Fix intervals
+
+# filtered and complete dataset 
+df_complete <- df_focused %>%
+  filter(station %in% complete_stations)
+
+# Unique stations for spatial points
+sp_unique <- df_complete %>%
+  distinct(station, X_mn95, Y_mn95) %>%
+  arrange(station)
+
+sp_unique <- SpatialPoints(
+  coords = sp_unique[, c("X_mn95", "Y_mn95")],
+  proj4string = CRS("+proj=somerc +lat_0=46.9524055555556 +lon_0=7.43958333333333 +k_0=1 +x_0=2600000 +y_0=1200000 +ellps=bessel +units=m +no_defs")
+)
+
+# Prepare station-major time vector (sorted by station then time)
+stidf_data <- df_complete %>%
+  arrange(time_bin, station) %>%      # <- station-major
+  select(anomaly_score)
+
+# STFDF creation
+stidf_obj <- STFDF(
+  sp = sp_unique,
+  time = sort(unique(df_complete$time_bin)),
+  data = stidf_data
+)
+
+cat("STFDF object created successfully!\n")
+cat("Dimensions: Stations =", length(sp_unique), "Times =", length(unique(df_complete$time_bin)), "\n")
+```
+
+
+
+NEW
+```{r}
+# Define temporal lags: 5-min intervals (600 seconds) up to 7200 seconds (2 hours)
+tlags = seq(0, 120, by = 10)
+
+vv_wide <- suppressWarnings(variogram(
+  object = anomaly_score ~ 1,
+  data = stidf_obj,
+  width = 250,          # spatial lag in meters
+  cutoff = 4000,        # max distance
+  tlags = tlags,    # temporal lags in mins
+  tunit = "mins"
+))
+```
+
+```{r}
+
+#vv$timelag 
+print(head(vv_wide))
+plot(vv_wide, main = "Empirical Spatio-Temporal Variogram (1-min bins), 10 min intervals")
+```
+
+
+```{r}
+plot(vv_wide, map = FALSE, wireframe = FALSE, all = TRUE,
+     main = "Spatio-temporal variogram (all spatial and temporal lags)")
+```
+
+```{r}
+
+vv_wide %>%
+  mutate(spacelag = round(spacelag, -2)) %>%  # round to 100s of meters for grouping
+  ggplot(aes(x = timelag, y = gamma, color = factor(spacelag))) +
+  geom_line() +
+  geom_point(size = 1.5) +
+  scale_color_viridis_d(name = "Spatial lag (m)") +
+  labs(title = "Empirical Spatio-temporal Variogram",
+       x = "Time lag (minutes)", y = "Semivariance") +
+  theme_minimal()
+
+```
+
+```{r}
+# Create pairwise distance matrix between stations
+
+# Get unique station coordinates
+station_coords <- df_complete %>%
+  distinct(station, X_mn95, Y_mn95) %>%
+  arrange(station)
+
+cat("Number of stations:", nrow(station_coords), "\n")
+
+# Calculate pairwise Euclidean distances
+n_stations <- nrow(station_coords)
+dist_matrix <- matrix(0, nrow = n_stations, ncol = n_stations)
+rownames(dist_matrix) <- station_coords$station
+colnames(dist_matrix) <- station_coords$station
+
+for (i in 1:n_stations) {
+  for (j in 1:n_stations) {
+    if (i != j) {
+      dist_matrix[i, j] <- sqrt(
+        (station_coords$X_mn95[i] - station_coords$X_mn95[j])^2 +
+        (station_coords$Y_mn95[i] - station_coords$Y_mn95[j])^2
+      )
+    }
+  }
+}
+
+# Display distance matrix
+cat("\nPairwise distance matrix (meters):\n")
+print(round(dist_matrix, 0))
+
+# Summary statistics
+cat("\nDistance Summary Statistics:\n")
+cat("Min distance (excluding 0):", min(dist_matrix[dist_matrix > 0]), "m\n")
+cat("Max distance:", max(dist_matrix), "m\n")
+cat("Mean distance:", mean(dist_matrix[dist_matrix > 0]), "m\n")
+cat("Median distance:", median(dist_matrix[dist_matrix > 0]), "m\n")
+
+# Visualize distance distribution
+hist(dist_matrix[upper.tri(dist_matrix)], 
+     breaks = 30,
+     main = "Distribution of Inter-Station Distances",
+     xlab = "Distance (meters)",
+     col = "steelblue")
+
+
+# Alternative: Use corrplot for cleaner visualization
+library(corrplot)
+corrplot(dist_matrix, 
+         is.corr = FALSE,
+         method = "color",
+         col = viridis(200),
+         addCoef.col = "black",
+         number.cex = 0.7,
+         tl.col = "black",
+         tl.srt = 45,
+         title = "Pairwise Station Distances (m)",
+         mar = c(0,0,2,0))
+
+# Create a more detailed summary table
+dist_summary <- data.frame(
+  Station = station_coords$station,
+  Mean_Distance = apply(dist_matrix, 1, function(x) mean(x[x > 0])),
+  Min_Distance = apply(dist_matrix, 1, function(x) min(x[x > 0])),
+  Max_Distance = apply(dist_matrix, 1, max),
+  N_Within_500m = apply(dist_matrix, 1, function(x) sum(x > 0 & x <= 500)),
+  N_Within_1km = apply(dist_matrix, 1, function(x) sum(x > 0 & x <= 1000))
+)
+
+cat("\nPer-station distance summary:\n")
+print(dist_summary)
+
+# Identify nearest neighbors
+cat("\nNearest neighbor for each station:\n")
+for (i in 1:n_stations) {
+  distances <- dist_matrix[i, ]
+  distances[i] <- Inf  # Exclude self
+  nearest_idx <- which.min(distances)
+  cat(sprintf("%-10s -> %-10s: %.0f m\n", 
+              station_coords$station[i],
+              station_coords$station[nearest_idx],
+              distances[nearest_idx]))
+}
+
+# Check against your variogram range
+variogram_range <- 531  # From your SumMetric model
+n_pairs_within_range <- sum(dist_matrix > 0 & dist_matrix <= variogram_range)
+n_total_pairs <- sum(dist_matrix > 0) / 2  # Divide by 2 since matrix is symmetric
+
+cat("\nComparison with variogram range (531m):\n")
+cat("Station pairs within range:", n_pairs_within_range / 2, 
+    "out of", n_total_pairs, 
+    sprintf("(%.1f%%)\n", (n_pairs_within_range / 2 / n_total_pairs) * 100))
+```
+
+
+```{r}
+# plot gamma vs timelag for spacelag = 0
+vv_wide %>% 
+  filter(spacelag == 0) %>%
+  ggplot(aes(x = timelag, y = gamma)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Temporal correlation at zero spatial lag",
+       x = "Time lag (5 min bins)", y = "Semivariance (gamma)")
+
+# plot gamma vs spacelag for first time lag
+vv_wide %>% 
+  filter(timelag == min(timelag[timelag>0])) %>%
+  ggplot(aes(x = avgDist, y = gamma)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Spatial correlation at first time lag",
+       x = "Distance (m)", y = "Semivariance (gamma)")
+```
+
+
+
+
+
+MODELS
+```{r}
+cat("Fitting bounded spatio-temporal variogram models...\n")
+
+candidate_models <- c("Exp", "Sph", "Ste", "Sep", "Metric", "SumMetric")
+fit_results <- list()
+
+for (model in candidate_models) {
+  cat("Trying model:", model, "...\n")
+  
+  tryCatch({
+    if (model == "Sep") {
+      # Separable model
+      stVgm_init <- vgmST(
+        "separable",
+        space = vgm(psill = 0.5, model = "Exp", range = 650, nugget = 0.1),
+        time  = vgm(psill = 0.5, model = "Exp", range = 10, nugget = 0.1),
+        sill  = 1
+      )
+      
+      fit_results[[model]] <- fit.StVariogram(
+        vv_wide, stVgm_init,
+        method = "L-BFGS-B",
+        lower = c(100, 0.01, 5, 0.01, 0.5),
+        upper = c(5000, 1, 200, 1, 3),
+        fit.method = 6
+      )
+      
+    } else if (model %in% c("Exp", "Sph", "Ste")) {
+      # Product-sum models
+      stVgm_init <- vgmST(
+        "productSum",
+        space = vgm(psill = 0.5, model = model, range = 650, nugget = 0.1),
+        time  = vgm(psill = 0.5, model = model, range = 10, nugget = 0.1),
+        k = 0.05
+      )
+      
+      fit_results[[model]] <- fit.StVariogram(
+        vv_wide, stVgm_init,
+        method = "L-BFGS-B",
+        lower = c(100, 0.01, 5, 0.01, 0.001),
+        upper = c(5000, 1, 200, 1, 2),
+        fit.method = 6
+      )
+      
+    } else if (model == "Metric") {
+      # Metric model as per your example
+      metric_init <- vgmST("metric", 
+                         joint = vgm(50, "Exp", 500, 0), 
+                         stAni = 50)
+      
+      # Parameter bounds: spatial_range, spatial_nugget, temporal_range, temporal_nugget, stAni
+      pars.l <- c(100, 0.01, 5, 0.01, 10)    # lower bounds
+      pars.u <- c(5000, 1, 200, 1, 500)      # upper bounds
+      
+      fit_results[[model]] <- fit.StVariogram(
+        vv_wide, 
+        metric_init, 
+        method = "L-BFGS-B",
+        lower = pars.l,
+        upper = pars.u,
+        fit.method = 6,
+        tunit = "mins"  # Important: specify your time unit
+      )
+      
+    } else if (model == "SumMetric") {
+      # SumMetric model as per your example
+      sumMetric_init <- vgmST("sumMetric",
+                            space = vgm(psill = 5, "Exp", range = 500, nugget = 0),
+                            time = vgm(psill = 5, "Exp", range = 10, nugget = 0), 
+                            joint = vgm(psill = 1, "Exp", range = 500, nugget = 10),
+                            stAni = 50)
+      
+      # Parameter bounds: space_psill, space_range, space_nugget, 
+      #                  time_psill, time_range, time_nugget,
+      #                  joint_psill, joint_range, joint_nugget, stAni
+      pars.l <- c(0.1, 100, 0.01,    # space
+                  0.1, 5, 0.01,      # time  
+                  0.1, 100, 0.01,    # joint
+                  10)                # stAni
+      pars.u <- c(10, 5000, 1,       # space
+                  10, 200, 1,        # time
+                  10, 5000, 1,       # joint  
+                  500)               # stAni
+      
+      fit_results[[model]] <- fit.StVariogram(
+        vv_wide, 
+        sumMetric_init, 
+        method = "L-BFGS-B",
+        lower = pars.l,
+        upper = pars.u, 
+        fit.method = 6,
+        tunit = "mins"  # Specify your time unit
+      )
+    }
+    
+    cat("Model", model, "fit successfully.\n")
+    
+  }, error = function(e) {
+    cat("Model", model, "failed:", e$message, "\n")
+  })
+}
+
+str(fit_results, 1)
+```
+
+BEST S-T MODEL FROM MSE
+```{r}
+
+# Extract MSE values 
+mse_values <- sapply(fit_results, function(fit) {
+  mse <- attr(fit, "MSE")
+  if (is.null(mse) || is.na(mse)) return(NA)
+  return(mse)
+})
+
+# Print diagnostic information
+cat("Extracted MSE values:\n")
+print(mse_values)
+
+# Remove models with missing MSE
+valid_mse <- mse_values[!is.na(mse_values)]
+
+if (length(valid_mse) == 0) {
+  stop("o valid models found — check fit_results or optimization output.")
+}
+
+# Identify model with the smallest MSE
+best_model_name <- names(which.min(valid_mse))
+best_mse <- min(valid_mse, na.rm = TRUE)
+
+cat("\nBest model selected:", best_model_name, "\n")
+cat("MSE =", best_mse, "\n")
+
+# Retrieve the actual model object
+best_fit <- fit_results[[best_model_name]]
+
+# Safety check
+if (is.null(best_fit)) {
+  stop(paste("Model object not found for:", best_model_name))
+}
+
+# Print summary
+cat("\nSummary of best-fit model:\n")
+print(best_fit)
+
+# visualize fit
+plot(vv_wide, best_fit, main = paste("Best Spatio-Temporal Variogram Fit:", best_model_name))
+```
+```{r}
+# Compare SumMetric vs Metric visually
+par(mfrow = c(1, 2))
+plot(vv_wide, fit_results[["Metric"]], 
+     main = paste("Metric - MSE:", round(attr(fit_results[["Metric"]], "MSE"), 2)))
+plot(vv_wide, fit_results[["SumMetric"]], 
+     main = paste("SumMetric - MSE:", round(attr(fit_results[["SumMetric"]], "MSE"), 2)))
+```
+
+
+```{r}
+# Why did Exp, Sph, Ste have MSE = 90,000?
+# Check if they converged
+for (model_name in c("Exp", "Sph", "Ste")) {
+  cat("\n---", model_name, "---\n")
+  print(fit_results[[model_name]])
+  
+  # Check convergence message
+  if (!is.null(attr(fit_results[[model_name]], "convergence"))) {
+    cat("Convergence:", attr(fit_results[[model_name]], "convergence"), "\n")
+  }
+}
+```
+
+
+```{r}
+# Check if fitted models make physical sense
+for (model_name in names(fit_results)) {
+  if (!is.null(fit_results[[model_name]])) {
+    cat("\n---", model_name, "---\n")
+    print(fit_results[[model_name]])
+    
+    # Plot fit vs empirical
+    plot(vv_wide, fit_results[[model_name]], 
+         main = paste("Fit:", model_name))
+  }
+}
+```
+
+KRIGING ON KNOWN SPACE - WITHOLDING
+```{r}
+library(RColorBrewer)
+library(lattice)
+
+set.seed(105) # reproducibility
+
+# Convert STFDF to STIDF for convenience 
+stidf_idf <- as(stidf_obj, "STIDF")
+
+
+# Randomly withhold 20% of the observations for testing
+#n_total <- nrow(stidf_idf@data)
+#test_idx <- sample(1:n_total, size = floor(0.2 * n_total))
+
+# Split to train test
+#train_ST <- stidf_idf[-test_idx, ]
+#test_ST  <- stidf_idf[test_idx, ]
+
+station_info <- df_complete %>%
+  distinct(station, X_mn95, Y_mn95) %>%
+  arrange(station)
+
+# Sample stations
+n_stations <- nrow(station_info)
+test_stations <- sample(station_info$station, size = floor(0.2 * n_stations))
+
+cat("Test stations:", test_stations, "\n")
+
+# Find indices corresponding to these stations
+# Match coordinates back to STIDF
+test_coords <- station_info %>%
+  filter(station %in% test_stations) %>%
+  select(X_mn95, Y_mn95)
+
+test_idx <- which(
+  stidf_idf@sp@coords[, 1] %in% test_coords$X_mn95 &
+  stidf_idf@sp@coords[, 2] %in% test_coords$Y_mn95
+)
+
+train_ST <- stidf_idf[-test_idx, ]
+test_ST  <- stidf_idf[test_idx, ]
+
+cat("Training points:", nrow(train_ST@data), "\n")
+cat("Test points:", nrow(test_ST@data), "\n")
+cat("Number of test stations:", length(test_stations), "\n")
+
+# Extract spatio-temporal anisotropy from your best model
+stAni_value <- best_fit$stAni
+
+
+cat("Using stAni =", stAni_value, "meters per minute\n")
+
+# Predict at the withheld locations using best variogram model 
+pred_test <- krigeST(
+  formula = anomaly_score ~ 1,
+  data = train_ST,
+  newdata = test_ST,
+  modelList = best_fit,
+  nmax = 30, # up to 30 nearest neighbors
+  stAni = stAni_value,
+  computeVar = TRUE
+)
+
+# Extract predictions and compute errors
+pred_vals <- pred_test@data$var1.pred
+obs_vals  <- test_ST@data$anomaly_score
+errors    <- pred_vals - obs_vals
+
+rmse <- sqrt(mean(errors^2))
+mae  <- mean(abs(errors))
+bias <- mean(errors)
+correlation <- cor(pred_vals, obs_vals)
+r2 <- correlation^2
+```
+
+
+```{r}
+
+cat("\n=== Model Performance Evaluation ===\n")
+
+# 1. Basic statistics
+obs_vals <- test_ST@data$anomaly_score
+pred_vals <- pred_test@data$var1.pred
+errors <- pred_vals - obs_vals
+
+cat("\nObserved values:\n")
+cat("  Mean:", mean(obs_vals), "SD:", sd(obs_vals), "\n")
+cat("  Range: [", min(obs_vals), ",", max(obs_vals), "]\n")
+
+cat("\nPredicted values:\n")
+cat("  Mean:", mean(pred_vals), "SD:", sd(pred_vals), "\n")
+cat("  Range: [", min(pred_vals), ",", max(pred_vals), "]\n")
+
+# 2. Error metrics
+rmse <- sqrt(mean(errors^2))
+mae <- mean(abs(errors))
+bias <- mean(errors)
+
+cat("\n--- Error Metrics ---\n")
+cat("RMSE:", rmse, "\n")
+cat("MAE:", mae, "\n")
+cat("Bias:", bias, "\n")
+cat("Max Error:", max(abs(errors)), "\n")
+
+# 3. Normalized metrics (scale-independent)
+nrmse <- rmse / sd(obs_vals)
+nmae <- mae / sd(obs_vals)
+
+cat("\n--- Normalized Metrics ---\n")
+cat("NRMSE:", nrmse, "\n")
+cat("NMAE:", nmae, "\n")
+
+# 4. Skill scores (comparison to baseline)
+baseline_rmse <- sd(obs_vals)
+skill_score <- 1 - (rmse / baseline_rmse)
+
+cat("\n--- Model Skill ---\n")
+cat("Baseline RMSE (predict mean):", baseline_rmse, "\n")
+cat("Skill Score:", skill_score, "\n")
+cat("Improvement over baseline:", skill_score * 100, "%\n")
+
+# 5. Correlation metrics
+correlation <- cor(pred_vals, obs_vals)
+r2 <- correlation^2
+
+cat("\n--- Correlation Metrics ---\n")
+cat("Correlation:", correlation, "\n")
+cat("R²:", r2, "\n")
+
+# 6. Percentage errors
+mape <- mean(abs(errors / obs_vals)) * 100  # if no zeros
+
+cat("\n--- Percentage Errors ---\n")
+cat("MAPE:", mape, "%\n")
+
+# 7. Visualize prediction vs observed
+par(mfrow = c(2, 2))
+
+# Scatter plot
+plot(obs_vals, pred_vals,
+     xlab = "Observed", ylab = "Predicted",
+     main = "Predicted vs Observed")
+abline(0, 1, col = "red", lwd = 2)
+abline(lm(pred_vals ~ obs_vals), col = "blue", lwd = 2, lty = 2)
+legend("bottomright",
+       legend = c("Perfect", "Fitted"),
+       col = c("red", "blue"),
+       lty = c(1, 2),
+       bty = "n") 
+
+# Residual plot
+plot(pred_vals, errors,
+     xlab = "Predicted", ylab = "Residual",
+     main = "Residual Plot")
+abline(h = 0, col = "red", lwd = 2)
+
+# Histogram of errors
+hist(errors, breaks = 30,
+     main = "Error Distribution",
+     xlab = "Error")
+abline(v = 0, col = "red", lwd = 2)
+
+# QQ plot
+qqnorm(errors)
+qqline(errors, col = "red", lwd = 2)
+```
+
+
+
+```{r}
+
+```
+
+
+
+KRIGGING HOLD OUT SPATIOTEMPORAL BLOCKS
+
+```{r}
+# ============================================================================
+# STRATEGY 2: Single Station + Temporal Block (MODIFIED)
+# Hold out station ILL12 AND last 20% of time
+# ============================================================================
+
+cat("\n\n=== STRATEGY 2: Single Station + Temporal Block ===\n")
+
+set.seed(456)
+
+# Convert to STIDF
+stidf_idf <- as(stidf_obj, "STIDF")
+
+# Specify test station
+test_station <- "ILL12"
+
+# Get unique times and define temporal holdout (last 20%)
+unique_times <- sort(unique(df_complete$time_bin))
+n_test_times <- floor(0.2 * length(unique_times))
+test_time_start <- unique_times[length(unique_times) - n_test_times + 1]
+test_times <- unique_times[unique_times >= test_time_start]
+
+cat("Test station:", test_station, "\n")
+cat("Test time period:", format(test_time_start), "to", format(max(test_times)), "\n")
+cat("Number of test time points:", length(test_times), "\n")
+
+# Create indices for spatiotemporal holdout
+# Need to match station ILL12 in the STIDF object
+# Get the spatial index for ILL12
+station_match <- which(station_coords$station == test_station)
+test_station_coords <- station_coords[station_match, ]
+
+cat("\nTest station coordinates:\n")
+print(test_station_coords)
+
+# Find all observations for ILL12 in the test time period
+test_idx_st2 <- which(
+  abs(stidf_idf@sp@coords[, 1] - test_station_coords$X_mn95) < 1 &  # Match by coordinates
+  abs(stidf_idf@sp@coords[, 2] - test_station_coords$Y_mn95) < 1 &
+  index(stidf_idf@time) %in% test_times
+)
+
+# Also need to identify ALL ILL12 observations (for context)
+all_ill12_idx <- which(
+  abs(stidf_idf@sp@coords[, 1] - test_station_coords$X_mn95) < 1 &
+  abs(stidf_idf@sp@coords[, 2] - test_station_coords$Y_mn95) < 1
+)
+
+cat("\nTotal ILL12 observations in dataset:", length(all_ill12_idx), "\n")
+cat("ILL12 observations in test period:", length(test_idx_st2), "\n")
+
+# Create train/test split
+train_ST_st2 <- stidf_idf[-test_idx_st2, ]
+test_ST_st2 <- stidf_idf[test_idx_st2, ]
+
+cat("\nTraining points:", nrow(train_ST_st2@data), "\n")
+cat("Test points:", nrow(test_ST_st2@data), "\n")
+
+# Verify the split
+cat("\nVerification:\n")
+cat("Training period:", format(min(index(train_ST_st2@time))), "to", 
+    format(max(index(train_ST_st2@time))), "\n")
+cat("Test period:", format(min(index(test_ST_st2@time))), "to", 
+    format(max(index(test_ST_st2@time))), "\n")
+
+# Check that ILL12 + test times are not in training
+train_ill12_in_test_period <- sum(
+  abs(train_ST_st2@sp@coords[, 1] - test_station_coords$X_mn95) < 1 &
+  abs(train_ST_st2@sp@coords[, 2] - test_station_coords$Y_mn95) < 1 &
+  index(train_ST_st2@time) >= test_time_start
+)
+cat("ILL12 obs in test period found in training (should be 0):", train_ill12_in_test_period, "\n")
+
+# Perform kriging
+cat("\n=== Performing spatiotemporal kriging ===\n")
+cat("Predicting at station ILL12 for future time period...\n")
+
+pred_test_st2 <- krigeST(
+  formula = anomaly_score ~ 1,
+  data = train_ST_st2,
+  newdata = test_ST_st2,
+  modelList = best_fit,
+  nmax = 30,
+  stAni = best_fit$stAni,
+  computeVar = TRUE
+)
+
+# Extract predictions and evaluate
+pred_vals_st2 <- pred_test_st2@data$var1.pred
+obs_vals_st2 <- test_ST_st2@data$anomaly_score
+errors_st2 <- pred_vals_st2 - obs_vals_st2
+
+```
+
+```{r}
+cat("\n===Results Station ILL12 + Future Times ===\n")
+
+cat("\nObserved values at test location:\n")
+cat("  Mean:", mean(obs_vals_st2), "SD:", sd(obs_vals_st2), "\n")
+cat("  Range: [", min(obs_vals_st2), ",", max(obs_vals_st2), "]\n")
+
+cat("\nPredicted values:\n")
+cat("  Mean:", mean(pred_vals_st2), "SD:", sd(pred_vals_st2), "\n")
+cat("  Range: [", min(pred_vals_st2), ",", max(pred_vals_st2), "]\n")
+
+cat("\n--- Error Metrics ---\n")
+rmse_st2 <- sqrt(mean(errors_st2^2))
+mae_st2 <- mean(abs(errors_st2))
+bias_st2 <- mean(errors_st2)
+nrmse_st2 <- rmse_st2 / sd(obs_vals_st2)
+correlation_st2 <- cor(pred_vals_st2, obs_vals_st2)
+r2_st2 <- correlation_st2^2
+skill_st2 <- 1 - rmse_st2 / sd(obs_vals_st2)
+
+cat("RMSE:", rmse_st2, "\n")
+cat("MAE:", mae_st2, "\n")
+cat("Bias:", bias_st2, "\n")
+cat("Max Error:", max(abs(errors_st2)), "\n")
+
+cat("\n--- Normalized Metrics ---\n")
+cat("NRMSE:", nrmse_st2, "\n")
+
+cat("\n--- Model Skill ---\n")
+cat("Baseline RMSE (predict mean):", sd(obs_vals_st2), "\n")
+cat("Skill Score:", skill_st2, "\n")
+cat("Improvement over baseline:", skill_st2 * 100, "%\n")
+
+cat("\n--- Correlation Metrics ---\n")
+cat("Correlation:", correlation_st2, "\n")
+cat("R²:", r2_st2, "\n")
+
+```
+
+```{r}
+# Visualizations
+par(mfrow = c(2, 2))
+
+# 1. Scatter plot
+plot(obs_vals_st2, pred_vals_st2, 
+     xlab = "Observed", ylab = "Predicted",
+     main = "ILL12: Predicted vs Observed (Future Times)",
+     pch = 16, col = alpha("blue", 0.6))
+abline(0, 1, col = "red", lwd = 2)
+abline(lm(pred_vals_st2 ~ obs_vals_st2), col = "black", lwd = 2, lty = 2)
+legend("topleft", 
+       legend = c("Perfect", "Fitted", paste("R² =", round(r2_st2, 3))),
+       col = c("red", "black", NA), lty = c(1, 2, NA), bty = "n")
+
+# 2. Time series plot
+test_times_seq <- index(test_ST_st2@time)
+plot(test_times_seq, obs_vals_st2, type = "l", col = "black", lwd = 2,
+     xlab = "Time", ylab = "Anomaly Score",
+     main = "ILL12: Observed vs Predicted Over Time")
+lines(test_times_seq, pred_vals_st2, col = "red", lwd = 2, lty = 2)
+legend("topleft", legend = c("Observed", "Predicted"),
+       col = c("black", "red"), lty = c(1, 2), lwd = 2,
+       cex = 0.8,              # smaller text
+       pt.cex = 0.8,           # smaller line symbol
+       box.lwd = 0.5,          # thinner box border
+       seg.len = 1.2,          # shorter line segment
+       y.intersp = 0.6,        # tighten vertical spacing
+       x.intersp = 0.6,        # tighten horizontal spacing
+       inset = 0.02,           # move slightly inward
+       text.width = strwidth("Observed") * 0.9)   
+
+
+# 3. Residual plot
+plot(pred_vals_st2, errors_st2,
+     xlab = "Predicted", ylab = "Residual",
+     main = "Residual Plot",
+     pch = 16, col = alpha("blue", 0.6))
+abline(h = 0, col = "red", lwd = 2)
+
+# 4. Histogram of errors
+hist(errors_st2, breaks = 30,
+     main = "Error Distribution",
+     xlab = "Prediction Error",
+     col = "lightblue", border = "white")
+abline(v = 0, col = "red", lwd = 2)
+abline(v = mean(errors_st2), col = "blue", lwd = 2, lty = 2)
+legend("topleft", legend = c("Zero", "Mean error"),
+       col = c("red", "blue"), lty = c(1, 2))
+
+
+# Interpretation
+cat("\n=== INTERPRETATION ===\n")
+cat("This tests: Can we predict anomaly scores at station ILL12 in the FUTURE,\n")
+cat("            using only data from OTHER stations (some >1km away)?\n\n")
+
+if (r2_st2 < 0.2) {
+  cat("Result: POOR - Model cannot extrapolate to this station+time combination.\n")
+  cat("        The station is likely beyond spatial correlation range AND\n")
+  cat("        temporal extrapolation is challenging.\n")
+} else if (r2_st2 < 0.4) {
+  cat("Result: WEAK - Model has limited predictive power for this scenario.\n")
+  cat("        Some temporal/spatial structure captured but high uncertainty.\n")
+} else if (r2_st2 < 0.6) {
+  cat("Result: MODERATE - Model provides useful predictions despite extrapolation.\n")
+  cat("        Spatio-temporal coupling helps bridge the spatial gap.\n")
+} else {
+  cat("Result: GOOD - Model successfully predicts at unseen location+time.\n")
+  cat("        Strong spatio-temporal structure enables extrapolation.\n")
+}
+
+cat("\nComparison to nearest training station:\n")
+cat("Nearest station to ILL12:", "ILL13", "at 1092m (beyond 531m spatial range)\n")
+```
+```{r}
+# ============================================================================
+# SPATIAL MAPS: Predictions vs Observations at Multiple Stations
+# ============================================================================
+
+library(ggplot2)
+library(sf)
+library(viridis)
+library(patchwork)
+
+# Since we only withheld ILL12 + future times, let's create spatial predictions
+# at ALL stations for a specific time point in the test period
+
+# Select a representative time point from the test period
+selected_time <- test_times[floor(length(test_times) / 2)]  # Middle of test period
+cat("Selected time for visualization:", format(selected_time), "\n")
+
+# Create a grid of all station locations for this time
+all_stations_sf <- st_as_sf(station_coords, 
+                             coords = c("X_mn95", "Y_mn95"), 
+                             crs = 2056)
+
+# Get actual observations at this time (if available)
+obs_at_time <- df_complete %>%
+  filter(time_bin == selected_time) %>%
+  select(station, X_mn95, Y_mn95, anomaly_score) %>%
+  rename(observed = anomaly_score)
+
+# Create prediction points for all stations at this time
+pred_points <- expand.grid(
+  station = station_coords$station,
+  time_bin = selected_time
+) %>%
+  left_join(station_coords, by = "station")
+
+# Convert to spatial object for kriging
+pred_sp <- SpatialPoints(
+  coords = pred_points[, c("X_mn95", "Y_mn95")],
+  proj4string = CRS("+proj=somerc +lat_0=46.9524055555556 +lon_0=7.43958333333333 +k_0=1 +x_0=2600000 +y_0=1200000 +ellps=bessel +units=m +no_defs")
+)
+
+# Create STIDF for prediction
+pred_stidf <- STIDF(
+  sp = pred_sp,
+  time = selected_time,
+  data = data.frame(dummy = rep(NA, nrow(pred_points)))
+)
+
+cat("\nPerforming spatial prediction at all stations for time:", format(selected_time), "\n")
+
+# Predict at all stations for this time point
+spatial_pred <- krigeST(
+  formula = anomaly_score ~ 1,
+  data = train_ST_st2,  # Training data (excludes ILL12 in test period)
+  newdata = pred_stidf,
+  modelList = best_fit,
+  nmax = 30,
+  stAni = best_fit$stAni,
+  computeVar = TRUE
+)
+
+# Extract predictions
+pred_results <- data.frame(
+  station = pred_points$station,
+  X_mn95 = pred_points$X_mn95,
+  Y_mn95 = pred_points$Y_mn95,
+  predicted = spatial_pred@data$var1.pred,
+  prediction_var = spatial_pred@data$var1.var
+)
+
+# Merge with observations
+spatial_data <- pred_results %>%
+  left_join(obs_at_time, by = c("station", "X_mn95", "Y_mn95")) %>%
+  mutate(
+    error = predicted - observed,
+    is_test = station == "ILL12"  # Highlight the test station
+  )
+
+print(spatial_data)
+
+# ============================================================================
+# CREATE THE TWO MAPS
+# ============================================================================
+
+# Map 1: Predictions
+map_pred <- ggplot(spatial_data, aes(x = X_mn95, y = Y_mn95)) +
+  geom_point(aes(fill = predicted, size = is_test, shape = is_test), 
+             color = "black", stroke = 1.5) +
+  scale_fill_viridis(name = "Predicted\nAnomaly Score", 
+                     limits = range(c(spatial_data$predicted, spatial_data$observed), na.rm = TRUE)) +
+  scale_size_manual(values = c(4, 6), guide = "none") +
+  scale_shape_manual(values = c(21, 24), 
+                     labels = c("Training Station", "Test Station (ILL12)"),
+                     name = "") +
+  geom_text(aes(label = station), vjust = -1.5, size = 3) +
+  coord_sf(crs = 2056) +
+  labs(title = "Predicted Anomaly Scores",
+       subtitle = paste("Time:", format(selected_time)),
+       x = "X (MN95)", y = "Y (MN95)") +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+# Map 2: Observations
+map_obs <- ggplot(spatial_data, aes(x = X_mn95, y = Y_mn95)) +
+  geom_point(aes(fill = observed, size = is_test, shape = is_test), 
+             color = "black", stroke = 1.5) +
+  scale_fill_viridis(name = "Observed\nAnomaly Score",
+                     limits = range(c(spatial_data$predicted, spatial_data$observed), na.rm = TRUE)) +
+  scale_size_manual(values = c(4, 6), guide = "none") +
+  scale_shape_manual(values = c(21, 24), 
+                     labels = c("Training Station", "Test Station (ILL12)"),
+                     name = "") +
+  geom_text(aes(label = station), vjust = -1.5, size = 3) +
+  coord_sf(crs = 2056) +
+  labs(title = "Observed Anomaly Scores",
+       subtitle = paste("Time:", format(selected_time)),
+       x = "X (MN95)", y = "Y (MN95)") +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+# Display side-by-side
+map_pred + map_obs + 
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title = "Spatiotemporal Kriging: Predictions vs Observations",
+    subtitle = paste("Test: Station ILL12 withheld | Time:", format(selected_time))
+  )
+
+# ============================================================================
+# BONUS: Error map
+# ============================================================================
+
+map_error <- ggplot(spatial_data, aes(x = X_mn95, y = Y_mn95)) +
+  geom_point(aes(fill = error, size = is_test, shape = is_test), 
+             color = "black", stroke = 1.5) +
+  scale_fill_gradient2(name = "Prediction\nError", 
+                       low = "blue", mid = "white", high = "red",
+                       midpoint = 0) +
+  scale_size_manual(values = c(4, 6), guide = "none") +
+  scale_shape_manual(values = c(21, 24), 
+                     labels = c("Training Station", "Test Station (ILL12)"),
+                     name = "") +
+  geom_text(aes(label = station), vjust = -1.5, size = 3) +
+  coord_sf(crs = 2056) +
+  labs(title = "Prediction Errors",
+       subtitle = paste("Time:", format(selected_time)),
+       x = "X (MN95)", y = "Y (MN95)") +
+  theme_minimal() +
+  theme(legend.position = "right")
+
+print(map_error)
+
+# ============================================================================
+# ALTERNATIVE: Multiple time snapshots
+# ============================================================================
+
+# Select 4 time points throughout the test period
+time_snapshots <- test_times[round(seq(1, length(test_times), length.out = 4))]
+
+cat("\nCreating maps for multiple time points...\n")
+
+all_maps_pred <- list()
+all_maps_obs <- list()
+
+for (i in 1:length(time_snapshots)) {
+  selected_time <- time_snapshots[i]
+  
+  # Get observations
+  obs_at_time <- df_complete %>%
+    filter(time_bin == selected_time) %>%
+    select(station, anomaly_score) %>%
+    rename(observed = anomaly_score)
+  
+  # Create prediction STIDF
+  pred_stidf_t <- STIDF(
+    sp = pred_sp,
+    time = selected_time,
+    data = data.frame(dummy = rep(NA, length(pred_sp)))
+  )
+  
+  # Predict
+  spatial_pred_t <- krigeST(
+    formula = anomaly_score ~ 1,
+    data = train_ST_st2,
+    newdata = pred_stidf_t,
+    modelList = best_fit,
+    nmax = 30,
+    stAni = best_fit$stAni,
+    computeVar = FALSE  # Faster without variance
+  )
+  
+  # Combine
+  spatial_data_t <- data.frame(
+    station = pred_points$station,
+    X_mn95 = pred_points$X_mn95,
+    Y_mn95 = pred_points$Y_mn95,
+    predicted = spatial_pred_t@data$var1.pred
+  ) %>%
+    left_join(obs_at_time, by = "station") %>%
+    mutate(
+      error = predicted - observed,
+      is_test = station == "ILL12",
+      time = format(selected_time, "%m-%d %H:%M")
+    )
+  
+  # Prediction map
+  all_maps_pred[[i]] <- ggplot(spatial_data_t, aes(x = X_mn95, y = Y_mn95)) +
+    geom_point(aes(fill = predicted, size = is_test), 
+               shape = 21, color = "black") +
+    scale_fill_viridis(name = "Predicted", 
+                       limits = c(0.33, 0.78)) +
+    scale_size_manual(values = c(3, 5), guide = "none") +
+    labs(title = paste("T", i, ":", unique(spatial_data_t$time))) +
+    theme_minimal() +
+    theme(axis.title = element_blank(),
+          legend.position = "none")
+  
+  # Observation map
+  all_maps_obs[[i]] <- ggplot(spatial_data_t, aes(x = X_mn95, y = Y_mn95)) +
+    geom_point(aes(fill = observed, size = is_test), 
+               shape = 21, color = "black") +
+    scale_fill_viridis(name = "Observed",
+                       limits = c(0.33, 0.78)) +
+    scale_size_manual(values = c(3, 5), guide = "none") +
+    labs(title = paste("T", i, ":", unique(spatial_data_t$time))) +
+    theme_minimal() +
+    theme(axis.title = element_blank(),
+          legend.position = "none")
+}
+
+# Combine into grid
+library(gridExtra)
+
+grid.arrange(
+  grobs = c(all_maps_pred, all_maps_obs),
+  ncol = 4, nrow = 2,
+  top = "Predictions (top row) vs Observations (bottom row) at 4 Time Points"
+)
+```
+

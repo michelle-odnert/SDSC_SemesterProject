@@ -1,0 +1,408 @@
+---
+title: "IllgrabenExploratory3"
+output: html_notebook
+---
+
+
+
+```{r}
+library(arrow)
+library(dplyr)      
+library(ggplot2)     
+library(lubridate) 
+library(tidyr)  
+library(patchwork)
+library(corrplot)
+library(sp)          # spatial objects
+library(spacetime)   # space-time data classes
+library(gstat)       # variograms, kriging
+library(sf)
+library(terra)
+library(ggrepel)
+library(tibble)
+```
+
+
+### PREPROCESSING
+
+```{r}
+df_psd <- read_parquet("df_illgraben_may_to_sept.parquet")
+```
+```{r}
+df_anom <- read_parquet("df_illgraben_anomaly_scores.parquet")
+
+```
+```{r}
+coords <- read.delim("coords.txt", sep = "|", comment.char = "#", 
+                     header = FALSE, stringsAsFactors = FALSE)
+head(coords)
+```
+
+
+```{r}
+names(coords)
+```
+```{r}
+# Manually set the column names based on the header line
+col_names <- c("Network", "Station", "Location", "Channel", "Latitude", "Longitude", 
+               "Elevation", "Depth", "Azimuth", "Dip", "SensorDescription", "Scale", 
+               "ScaleFreq", "ScaleUnits", "SampleRate", "StartTime", "EndTime")
+
+# Apply the column names (skip the first row since it's the header)
+coords <- coords[-1, ]  # Remove the header row
+names(coords) <- col_names
+```
+
+```{r}
+# Numeric columns proper format
+coords <- coords %>%
+  mutate(
+    Latitude = as.numeric(Latitude),
+    Longitude = as.numeric(Longitude),
+    Elevation = as.numeric(Elevation)
+  )
+```
+
+```{r}
+# Get most recent entry for each station
+station_coords <- coords %>%
+  arrange(Station, desc(StartTime)) %>%
+  group_by(Station) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(Station, Latitude, Longitude, Elevation)
+
+print("Station coordinates:")
+print(station_coords)
+```
+
+### Convert to MN95/LV95 Swiss Coordinate System
+
+```{r}
+# Convert to spatial object in WGS84
+stations_wgs84 <- st_as_sf(station_coords, 
+                          coords = c("Longitude", "Latitude"), 
+                          crs = 4326)
+
+# Transform to MN95/LV95 (EPSG:2056)
+stations_mn95 <- st_transform(stations_wgs84, crs = 2056)
+
+# Extract MN95 coordinates
+stations_mn95_coords <- stations_mn95 %>%
+  mutate(
+    X_mn95 = st_coordinates(.)[,1],  # Easting
+    Y_mn95 = st_coordinates(.)[,2],  # Northing
+    Z = Elevation
+  ) %>%
+  st_drop_geometry() %>%
+  select(Station, X_mn95, Y_mn95, Z)
+
+print("Coordinates in MN95 system:")
+print(stations_mn95_coords)
+```
+
+### MERGE NEW COORDS
+```{r}
+# Check station matching
+cat("Stations in PSD data:", unique(df_psd$station), "\n")
+cat("Stations in anomaly data:", unique(df_anom$station), "\n")
+cat("Stations with coordinates:", unique(stations_mn95_coords$Station), "\n")
+
+# Merge coordinates with data
+df_psd_coords <- df_psd %>%
+  left_join(stations_mn95_coords, by = c("station" = "Station"))
+
+df_anom_coords <- df_anom %>%
+  left_join(stations_mn95_coords, by = c("station" = "Station"))
+
+# Check for successful merge
+cat("Missing coordinates in PSD data:", sum(is.na(df_psd_coords$X_mn95)), "\n")
+cat("Missing coordinates in anomaly data:", sum(is.na(df_anom_coords$X_mn95)), "\n")
+```
+
+### DATA CHECKS
+
+```{r}
+# Check structure and size
+cat("Data dimensions:", dim(df_anom_coords), "\n")
+cat("Memory usage:", format(object.size(df_anom_coords), units = "MB"), "\n")
+```
+
+## DOWNSAMPLE
+```{r}
+set.seed(123)
+df_sample <- df_anom_coords %>%
+  group_by(station) %>%
+  sample_frac(0.25) %>%  # Sample only 25% from each station
+  ungroup()
+
+cat("Sampled data dimensions:", dim(df_sample), "\n")
+cat("Sampled memory usage:", format(object.size(df_sample), units = "MB"), "\n")
+```
+
+```{r}
+# reduce by temporal aggregation
+df_clean <- df_sample %>%
+  mutate(
+    date = as.Date(time),
+    hour = hour(time),
+    time_group = paste0(date, "_", floor(hour/1))  # 6-hour blocks
+  ) %>%
+  group_by(station, time_group, X_mn95, Y_mn95, Z) %>%
+  summarize(
+    anomaly_score = mean(anomaly_score, na.rm = TRUE),
+    n_obs = n()
+  ) %>%
+  ungroup() %>%
+  mutate(
+    date = as.Date(substr(time_group, 1, 10)),
+    t = as.numeric(date - min(date))
+  ) %>%
+  filter(!is.na(X_mn95), !is.na(Y_mn95), !is.na(anomaly_score))
+
+cat("After temporal aggregation:", dim(df_clean), "\n")
+```
+
+```{r}
+# Check spatial coverage per day
+coverage_check <- df_clean %>%
+  group_by(date) %>%
+  summarize(
+    n_stations = n_distinct(station),
+    spatial_range = max(dist(cbind(X_mn95, Y_mn95)))  # Approx spatial extent
+  ) %>%
+  arrange(desc(n_stations))
+
+# Keep only days with good spatial coverage
+good_days <- coverage_check %>%
+  filter(n_stations >= 4) %>%  # At least 4 stations active
+  pull(date)
+
+df_final <- df_clean %>%
+  filter(date %in% good_days)
+
+cat("Final dataset with good coverage:", dim(df_final), "\n")
+cat("Unique dates:", n_distinct(df_final$date), "\n")
+cat("Unique stations:", n_distinct(df_final$station), "\n")
+```
+
+```{r}
+# Create STIDF object for variogram analysis
+coordinates <- df_final[, c("X_mn95", "Y_mn95")]
+spat_part <- SpatialPoints(coords = coordinates, 
+                          proj4string = CRS("+init=epsg:2056"))
+
+ST_obj <- STIDF(sp = spat_part,
+                time = df_final$date,
+                data = df_final[, c("anomaly_score", "station", "t", "Z")])
+
+cat("STIDF object created with", nrow(ST_obj), "observations\n")
+```
+```{r}
+# Compute variogram with parameters optimized for your dataset
+tryCatch({
+  vv <- variogram(object = anomaly_score ~ 1,
+                  data = ST_obj,
+                  width = 300,      # 300m spatial bins
+                  cutoff = 2500,    # 2.5km maximum distance (covers station spread)
+                  tlags = 0.01:14.01, # 0 to 14 days temporal lags
+                  assumeRegular = FALSE)
+  
+  print("Spatio-temporal variogram computed successfully!")
+  print(head(vv))
+  
+  # Plot the variogram
+  plot(vv, 
+       main = "Spatio-Temporal Variogram of Anomaly Scores",
+       xlab = "Spatial Distance (m)", 
+       ylab = "Temporal Lag (days)")
+  
+}, error = function(e) {
+  cat("Variogram computation failed:", e$message, "\n")
+  cat("Trying with simpler parameters...\n")
+  
+  # Fallback: simpler variogram
+  vv_simple <- variogram(object = anomaly_score ~ 1,
+                        data = ST_obj,
+                        width = 500,
+                        cutoff = 2000,
+                        tlags = 0.01:7.01,
+                        assumeRegular = FALSE)
+  
+  plot(vv_simple, 
+       main = "Simplified Spatio-Temporal Variogram",
+       xlab = "Spatial Distance (m)", 
+       ylab = "Temporal Lag (days)")
+})
+```
+
+```{r}
+# Hovmöller plot by elevation
+hov_data <- df_final %>%
+  mutate(elevation_band = cut(Z, breaks = seq(500, 2500, by = 300))) %>%
+  group_by(elevation_band, t) %>%
+  summarize(mean_anomaly = mean(anomaly_score, na.rm = TRUE),
+            n_obs = n()) %>%
+  filter(n_obs >= 2)
+
+ggplot(hov_data) +
+  geom_tile(aes(x = elevation_band, y = t, fill = mean_anomaly)) +
+  scale_fill_viridis_c(name = "Anomaly Score") +
+  labs(title = "Hovmöller Plot: Anomaly Scores by Elevation and Time",
+       x = "Elevation Band (m)", y = "Time Index") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+```{r}
+# Instead of full variogram, compute station correlations
+# Use the full original data for correlations
+# Use pairwise.complete.obs - calculates each correlation using all available pairs
+# correlates how stations' DAILY AVERAGE anomaly scores move together
+# Not raw 10-minute data, but smoothed daily patterns
+station_correlations_full <- df_anom_coords %>%
+  mutate(date = as.Date(time)) %>%
+  group_by(station, date) %>%
+  summarize(daily_anomaly = mean(anomaly_score, na.rm = TRUE),
+            .groups = 'drop') %>%
+  pivot_wider(names_from = station, values_from = daily_anomaly) %>%
+  select(-date) %>%
+  cor(use = "pairwise.complete.obs")
+
+cat("Station correlation matrix (pairwise complete)\n")
+print(station_correlations_full)
+```
+
+```{r}
+# Convert to plottable format
+corr_matrix <- as.data.frame(station_correlations_full) %>%
+  rownames_to_column("Station1") %>%
+  pivot_longer(cols = -Station1, names_to = "Station2", values_to = "Correlation")
+
+# Plot correlation matrix
+ggplot(corr_matrix, aes(x = Station1, y = Station2, fill = Correlation)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, limits = c(-1, 1)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Inter-Station Anomaly Score Correlations",
+       subtitle = "Based on full dataset")
+```
+
+```{r}
+# 1. Do upper stations (ILL16, ILL17, ILL18) correlate strongly?
+upper_corrs <- station_correlations_full[c("ILL16", "ILL17", "ILL18"), 
+                                        c("ILL16", "ILL17", "ILL18")]
+print("Upper station correlations:")
+print(upper_corrs)
+
+# 2. How do upper stations correlate with lower stations?
+upper_lower_corrs <- station_correlations_full[c("ILL16", "ILL17", "ILL18"), 
+                                              c("ILL11", "ILL12", "ILL13", "ILL14", "ILL15")]
+print("Upper vs Lower station correlations:")
+print(upper_lower_corrs)
+
+# 3. Which stations are most/least correlated?
+max_corr <- max(station_correlations_full[station_correlations_full < 1])
+min_corr <- min(station_correlations_full)
+
+cat("Maximum correlation (excluding self):", max_corr, "\n")
+cat("Minimum correlation:", min_corr, "\n")
+```
+```{r}
+# 1. Check if high correlations occur during debris flow events specifically
+debris_flow_correlations <- df_anom_coords %>%
+  filter(`debris flow` == 1) %>%  # During debris flows only
+  mutate(date = as.Date(time)) %>%
+  group_by(station, date) %>%
+  summarize(daily_anomaly = mean(anomaly_score, na.rm = TRUE)) %>%
+  pivot_wider(names_from = station, values_from = daily_anomaly) %>%
+  select(-date) %>%
+  cor(use = "pairwise.complete.obs")
+
+# 2. Compare with normal conditions
+normal_correlations <- df_anom_coords %>%
+  filter(`debris flow` == 0) %>%  # Normal conditions only
+  mutate(date = as.Date(time)) %>%
+  group_by(station, date) %>%
+  summarize(daily_anomaly = mean(anomaly_score, na.rm = TRUE)) %>%
+  pivot_wider(names_from = station, values_from = daily_anomaly) %>%
+  select(-date) %>%
+  cor(use = "pairwise.complete.obs")
+
+cat("Correlations DURING debris flows:\n")
+print(round(debris_flow_correlations, 2))
+
+cat("\nCorrelations during NORMAL conditions:\n")  
+print(round(normal_correlations, 2))
+```
+
+```{r}
+# Function to test if individual correlation differences are significant
+test_correlation_differences <- function(cor_debris, cor_normal, n_debris, n_normal) {
+  # Convert matrices to long format for testing
+  corr_diff_test <- data.frame(
+    Station1 = character(),
+    Station2 = character(),
+    Corr_Debris = numeric(),
+    Corr_Normal = numeric(),
+    Z_Score = numeric(),
+    P_Value = numeric(),
+    Significant = logical()
+  )
+  
+  stations <- rownames(cor_debris)
+  
+  for (i in 1:(length(stations)-1)) {
+    for (j in (i+1):length(stations)) {
+      stat1 <- stations[i]
+      stat2 <- stations[j]
+      
+      r1 <- cor_debris[stat1, stat2]
+      r2 <- cor_normal[stat1, stat2]
+      
+      # Fisher's z-transformation test for correlation differences
+      z1 <- 0.5 * log((1 + r1) / (1 - r1))  # Fisher z for debris flow
+      z2 <- 0.5 * log((1 + r2) / (1 - r2))  # Fisher z for normal
+      
+      # Standard error
+      se <- sqrt(1/(n_debris - 3) + 1/(n_normal - 3))
+      
+      # Z-test statistic
+      z_score <- (z1 - z2) / se
+      p_value <- 2 * (1 - pnorm(abs(z_score)))
+      
+      corr_diff_test <- rbind(corr_diff_test, data.frame(
+        Station1 = stat1,
+        Station2 = stat2,
+        Corr_Debris = r1,
+        Corr_Normal = r2,
+        Difference = r1 - r2,
+        Z_Score = z_score,
+        P_Value = p_value,
+        Significant = p_value < 0.05
+      ))
+    }
+  }
+  
+  return(corr_diff_test)
+}
+
+# Get sample sizes (number of time points)
+n_debris <- df_anom_coords %>% filter(`debris flow` == 1) %>% distinct(time) %>% nrow()
+n_normal <- df_anom_coords %>% filter(`debris flow` == 0) %>% distinct(time) %>% nrow()
+
+# Run the test
+corr_diff_results <- test_correlation_differences(
+  cor_debris = debris_flow_correlations,
+  cor_normal = normal_correlations,
+  n_debris = n_debris,
+  n_normal = n_normal
+)
+
+cat("Significant correlation differences (p < 0.05):\n")
+print(corr_diff_results %>% filter(Significant) %>% arrange(P_Value))
+```
+

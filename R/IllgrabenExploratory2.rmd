@@ -1,0 +1,400 @@
+---
+title: "Illgraben Exploratory 2"
+output: html_notebook
+---
+
+
+```{r}
+library(arrow)
+library(dplyr)      
+library(ggplot2)     
+library(lubridate) 
+library(tidyr)  
+library(patchwork)
+library(corrplot)
+library(sp)          # spatial objects
+library(spacetime)   # space-time data classes
+library(gstat)       # variograms, kriging
+library(sf)
+library(terra)
+library(ggrepel)
+library(automap)
+```
+
+
+### PREPROCESSING
+
+```{r}
+df_psd <- read_parquet("df_illgraben_may_to_sept.parquet")
+```
+```{r}
+df_anom <- read_parquet("df_illgraben_anomaly_scores.parquet")
+
+```
+```{r}
+coords <- read.delim("coords.txt", sep = "|", comment.char = "#", 
+                     header = FALSE, stringsAsFactors = FALSE)
+head(coords)
+```
+
+
+```{r}
+names(coords)
+```
+```{r}
+# Manually set the column names based on the header line
+col_names <- c("Network", "Station", "Location", "Channel", "Latitude", "Longitude", 
+               "Elevation", "Depth", "Azimuth", "Dip", "SensorDescription", "Scale", 
+               "ScaleFreq", "ScaleUnits", "SampleRate", "StartTime", "EndTime")
+
+# Apply the column names (skip the first row since it's the header)
+coords <- coords[-1, ]  # Remove the header row
+names(coords) <- col_names
+```
+
+```{r}
+# Numeric columns proper format
+coords <- coords %>%
+  mutate(
+    Latitude = as.numeric(Latitude),
+    Longitude = as.numeric(Longitude),
+    Elevation = as.numeric(Elevation)
+  )
+```
+
+```{r}
+# Get most recent entry for each station
+station_coords <- coords %>%
+  arrange(Station, desc(StartTime)) %>%
+  group_by(Station) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(Station, Latitude, Longitude, Elevation)
+
+print("Station coordinates:")
+print(station_coords)
+```
+
+### Convert to MN95/LV95 Swiss Coordinate System
+
+```{r}
+# Convert to spatial object in WGS84
+stations_wgs84 <- st_as_sf(station_coords, 
+                          coords = c("Longitude", "Latitude"), 
+                          crs = 4326)
+
+# Transform to MN95/LV95 (EPSG:2056)
+stations_mn95 <- st_transform(stations_wgs84, crs = 2056)
+
+# Extract MN95 coordinates
+stations_mn95_coords <- stations_mn95 %>%
+  mutate(
+    X_mn95 = st_coordinates(.)[,1],  # Easting
+    Y_mn95 = st_coordinates(.)[,2],  # Northing
+    Z = Elevation
+  ) %>%
+  st_drop_geometry() %>%
+  select(Station, X_mn95, Y_mn95, Z)
+
+print("Coordinates in MN95 system:")
+print(stations_mn95_coords)
+```
+
+### MERGE NEW COORDS
+```{r}
+# Check station matching
+cat("Stations in PSD data:", unique(df_psd$station), "\n")
+cat("Stations in anomaly data:", unique(df_anom$station), "\n")
+cat("Stations with coordinates:", unique(stations_mn95_coords$Station), "\n")
+
+# Merge coordinates with data
+df_psd_coords <- df_psd %>%
+  left_join(stations_mn95_coords, by = c("station" = "Station"))
+
+df_anom_coords <- df_anom %>%
+  left_join(stations_mn95_coords, by = c("station" = "Station"))
+
+# Check for successful merge
+cat("Missing coordinates in PSD data:", sum(is.na(df_psd_coords$X_mn95)), "\n")
+cat("Missing coordinates in anomaly data:", sum(is.na(df_anom_coords$X_mn95)), "\n")
+```
+
+### CREATE SPATIAL OBJECTS
+Spatial Conversion: Converting regular data frame into a spatial data frame where each point knows its geographic location
+
+Coordinate System: Using MN95/LV95 (EPSG:2056) - the Swiss coordinate system matches Swisstopo data
+
+Time + Space: Each observation has both temporal (time) and spatial (X_mn95, Y_mn95, Z) information
+
+```{r}
+# Unique stations
+psd_unique <- df_psd_coords %>%
+distinct(station, .keep_all = TRUE) %>%
+st_as_sf(coords = c("X_mn95", "Y_mn95"), crs = 2056)
+
+# Extract coords into a data frame
+psd_coords <- cbind(psd_unique, st_coordinates(psd_unique$geometry))
+
+# st_coordinates gives columns X and Y
+ggplot(psd_coords) +
+  geom_point(aes(x = X, y = Y, color = Z, size = Z)) +
+  ggrepel::geom_text_repel(aes(x = X, y = Y, label = station), size = 3) +
+  scale_color_viridis_c(name = "Elevation (m)") +
+  scale_size_continuous(name = "Elevation (m)") +
+  labs(
+    title = "Illgraben Station Locations",
+    subtitle = "MN95/LV95 Coordinate System",
+    x = "Easting (m)", y = "Northing (m)"
+  ) +
+  theme_minimal()
+```
+
+
+### VARIOGRAM
+```{r}
+df_anom_coords_debflow <- df_anom_coords %>% 'debris flow'=1
+```
+
+```{r}
+# COMPUTE STATION-AVERAGE ANOMALY 
+df_anom_coords_debflow <- df_anom_coords %>% 'debris flow'=1
+df_station_avg <- df_anom_coords %>%
+  group_by(station) %>%
+  summarise(
+    anomaly = mean(anomaly_score, na.rm = TRUE),  # average across all time points
+    X_mn95 = first(X_mn95),
+    Y_mn95 = first(Y_mn95),
+    .groups = "drop"
+  )
+
+cat("Number of stations:", nrow(df_station_avg), "\n")
+print(df_station_avg)
+
+# CONVERT TO SPATIAL OBJECT 
+time_slice <- df_station_avg
+coordinates(time_slice) <- ~X_mn95 + Y_mn95
+proj4string(time_slice) <- CRS("+init=epsg:2056")  # MN95/LV95
+
+# COMPUTE VARIOGRAM
+vg_model <- autofitVariogram(anomaly ~ 1, time_slice)
+
+# EXTRACT VARIOGRAM PARAMETERS
+vg_params <- list(
+  nugget = vg_model$var_model$psill[1],
+  sill   = sum(vg_model$var_model$psill),
+  range  = vg_model$var_model$range[2],
+  model  = vg_model$var_model$model[2]
+)
+
+cat("Variogram parameters (station-average):\n")
+print(vg_params)
+
+# PLOT STATION LOCATIONS WITH AVERAGE ANOMALY 
+ggplot(df_station_avg) +
+  geom_point(aes(x = X_mn95, y = Y_mn95, color = anomaly, size = anomaly)) +
+  geom_text_repel(aes(x = X_mn95, y = Y_mn95, label = station)) +
+  scale_color_viridis_c(name = "Average Anomaly") +
+  scale_size_continuous(name = "Average Anomaly") +
+  labs(
+    title = "Station Locations with Average Anomaly",
+    x = "Easting (X_mn95, m)",
+    y = "Northing (Y_mn95, m)"
+  ) +
+  theme_minimal()
+
+```
+
+
+
+```{r}
+
+# --- Function to compute temporal variogram using autofitVariogram ---
+compute_autofit_temporal_variogram <- function(df_station, station_name, cutoff_hours = 24, lag_hours = 0.5) {
+  
+  # Filter and bin data to 5-minute intervals
+  df_binned <- df_station %>%
+    filter(station == station_name) %>%
+    arrange(time) %>%
+    mutate(time_bin = floor_date(time, "5 minutes")) %>%
+    group_by(time_bin) %>%
+    summarise(
+      anomaly_score = mean(anomaly_score, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      # Convert to hours since start
+      time_hr = as.numeric(difftime(time_bin, min(time_bin), units = "hours")),
+      dummy_y = 0
+    )
+  
+  # Convert to spatial-like object for 1D variogram
+  coordinates(df_binned) <- ~time_hr + dummy_y
+  proj4string(df_binned) <- CRS(as.character(NA))
+  
+  # Compute empirical variogram (cutoff in hours)
+  vg_emp <- variogram(anomaly_score ~ 1, df_binned, cutoff = cutoff_hours, width = lag_hours)
+  
+  # Fit variogram automatically
+  vg_model <- autofitVariogram(anomaly_score ~ 1, df_binned, cutoff = cutoff_hours, width = lag_hours)
+  
+  # Extract model parameters
+  vg_params <- list(
+    nugget = vg_model$var_model$psill[1],
+    sill   = sum(vg_model$var_model$psill),
+    range  = vg_model$var_model$range[2],
+    model  = vg_model$var_model$model[2]
+  )
+  
+  cat("\nTemporal variogram parameters for", station_name, ":\n")
+  print(vg_params)
+  
+  return(list(empirical = vg_emp, fitted = vg_model))
+}
+
+# --- Compute for ILL12 and ILL16 ---
+resultILL18 <- compute_autofit_temporal_variogram(df_anom_coords, "ILL18")
+resultILL17 <- compute_autofit_temporal_variogram(df_anom_coords, "ILL17")
+result_ILL16 <- compute_autofit_temporal_variogram(df_anom_coords, "ILL16")
+result_ILL15 <- compute_autofit_temporal_variogram(df_anom_coords, "ILL15")
+result_ILL14 <- compute_autofit_temporal_variogram(df_anom_coords, "ILL14")
+result_ILL13 <- compute_autofit_temporal_variogram(df_anom_coords, "ILL13")
+result_ILL12 <- compute_autofit_temporal_variogram(df_anom_coords, "ILL12")
+result_ILL11 <- compute_autofit_temporal_variogram(df_anom_coords, "ILL11")
+
+
+
+
+```
+
+| Station | Nugget   | Sill    | Range (hours) | Model |
+| ------- | -------- | ------- | ------------- | ----- |
+| ILL18   | 0.000199 | 0.00279 | 4.08          | Ste   |
+| ILL17   | 0.000195 | 0.00216 | 2.42          | Ste   |
+| ILL16   | 0.000121 | 0.00158 | 5.07          | Ste   |
+| ILL15   | 0.000337 | 0.00431 | 4.13          | Exp   |
+| ILL14   | 2.44e-05 | 0.00275 | 2.49          | Ste   |
+| ILL13   | 0.000131 | 0.00310 | 10.27         | Sph   |
+| ILL12   | 0.000126 | 0.00451 | 6.80          | Ste   |
+| ILL11   | 7.82e-05 | 0.00219 | 9.53          | Sph   |
+
+
+```{r}
+# Plot variograms
+
+plot(resultILL18$empirical, model = resultILL18$fitted$var_model,
+     main = "Temporal Variogram - ILL18 (5-min bins)",
+     xlab = "Lag (hours)", ylab = "Semivariance")
+
+
+plot(resultILL17$empirical, model = resultILL17$fitted$var_model,
+     main = "Temporal Variogram - ILL17 (5-min bins)",
+     xlab = "Lag (hours)", ylab = "Semivariance")
+
+plot(result_ILL16$empirical, model = result_ILL16$fitted$var_model,
+     main = "Temporal Variogram - ILL16 (5-min bins)",
+     xlab = "Lag (hours)", ylab = "Semivariance")
+
+plot(result_ILL15$empirical, model = result_ILL15$fitted$var_model,
+     main = "Temporal Variogram - ILL15 (5-min bins)",
+     xlab = "Lag (hours)", ylab = "Semivariance")
+
+plot(result_ILL14$empirical, model = result_ILL14$fitted$var_model,
+     main = "Temporal Variogram - ILL14 (5-min bins)",
+     xlab = "Lag (hours)", ylab = "Semivariance")
+
+plot(result_ILL13$empirical, model = result_ILL13$fitted$var_model,
+     main = "Temporal Variogram - ILL13 (5-min bins)",
+     xlab = "Lag (hours)", ylab = "Semivariance")
+
+plot(result_ILL12$empirical, model = result_ILL12$fitted$var_model,
+     main = "Temporal Variogram - ILL12 (5-min bins)",
+     xlab = "Lag (hours)", ylab = "Semivariance")
+
+
+plot(result_ILL11$empirical, model = result_ILL11$fitted$var_model,
+     main = "Temporal Variogram - ILL11 (5-min bins)",
+     xlab = "Lag (hours)", ylab = "Semivariance")
+```
+
+DEBRIS FLOW TEMPORAL VARIOGRAMS
+
+```{r}
+### TEMPORAL VARIOGRAMS — DEBRIS FLOW DAYS ONLY
+
+# Filter for debris flow days
+event_days <- df_anom_coords %>%
+  filter(debris_flow == 1) %>%
+  mutate(date = as_date(time)) %>%
+  distinct(date) %>%
+  pull(date)
+
+cat("Number of debris flow event days:", length(event_days), "\n")
+
+# --- Filter anomaly data to only include event days ---
+df_anom_event <- df_anom_coords %>%
+  mutate(date = as_date(time)) %>%
+  filter(date %in% event_days)
+
+# --- Compute temporal variograms per station (event days only) ---
+compute_autofit_temporal_variogram <- function(df_station, station_name, cutoff_hours = 15, lag_hours = 0.5) {
+  df_binned <- df_station %>%
+    filter(station == station_name) %>%
+    arrange(time) %>%
+    mutate(time_bin = floor_date(time, "5 minutes")) %>%
+    group_by(time_bin) %>%
+    summarise(
+      anomaly_score = mean(anomaly_score, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      time_hr = as.numeric(difftime(time_bin, min(time_bin), units = "hours")),
+      dummy_y = 0
+    )
+
+  if (nrow(df_binned) < 10) {
+    message("Skipping station ", station_name, ": too few observations on event days.")
+    return(NULL)
+  }
+
+  coordinates(df_binned) <- ~time_hr + dummy_y
+  proj4string(df_binned) <- CRS(as.character(NA))
+
+  vg_emp <- variogram(anomaly_score ~ 1, df_binned, cutoff = cutoff_hours, width = lag_hours)
+  vg_model <- autofitVariogram(anomaly_score ~ 1, df_binned, cutoff = cutoff_hours, width = lag_hours)
+
+  vg_params <- list(
+    nugget = vg_model$var_model$psill[1],
+    sill   = sum(vg_model$var_model$psill),
+    range  = vg_model$var_model$range[2],
+    model  = vg_model$var_model$model[2]
+  )
+
+  cat("\nTemporal variogram parameters for", station_name, "(event days):\n")
+  print(vg_params)
+
+  return(list(empirical = vg_emp, fitted = vg_model))
+}
+
+# --- Apply to selected stations ---
+stations_to_plot <- c("ILL18", "ILL17", "ILL16", "ILL15", "ILL14", "ILL13", "ILL12", "ILL11")
+
+variograms_event <- lapply(stations_to_plot, function(st) {
+  compute_autofit_temporal_variogram(df_anom_event, st)
+})
+names(variograms_event) <- stations_to_plot
+
+
+# --- Plot results ---
+
+for (st in stations_to_plot) {
+  res <- variograms_event[[st]]
+  if (!is.null(res)) {
+    p <- plot(res$empirical, model = res$fitted$var_model,
+              main = paste("Temporal Variogram (Event Days) -", st, "(5-min bins)"),
+              xlab = "Lag (hours)", ylab = "Semivariance")
+    print(p)  # 👈 this forces the plot to render in loops / knitr
+  }
+}
+
+```
+

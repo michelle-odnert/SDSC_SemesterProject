@@ -1,0 +1,365 @@
+---
+title: "Illgraben Parquet Exploratory 1"
+output: html_notebook
+---
+
+
+```{r}
+library(arrow)
+library(dplyr)      
+library(ggplot2)     
+library(lubridate) 
+library(tidyr)  
+library(patchwork)
+library(corrplot)
+library(sp)          # spatial objects
+library(spacetime)   # space-time data classes
+library(gstat)       # variograms, kriging
+
+```
+
+
+```{r}
+df_psd <- read_parquet("df_illgraben_may_to_sept.parquet")
+```
+
+```{r}
+head(df_psd)
+```
+```{r}
+df_anom <- read_parquet("df_illgraben_anomaly_scores.parquet")
+```
+
+```{r}
+# Unique values in station column
+unique(df$station)
+unique(df2$station)
+```
+
+```{r}
+glimpse(df_psd)
+glimpse(df_anom)
+```
+```{r}
+# Number of records per station
+df_psd %>%
+  count(station) %>%
+  arrange(desc(n))
+```
+```{r}
+summary(df_anom$anomaly_score)
+```
+```{r}
+# Compare anomaly distributions across stations
+df_anom %>%
+  ggplot(aes(x = station, y = anomaly_score)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.6) +
+  labs(title = "Distribution of anomaly scores by station")
+
+```
+
+```{r}
+# Debris flow counts
+df_psd %>%
+  group_by(station) %>%
+  summarise(flow_events = sum(`debris flow`, na.rm = TRUE)) %>%
+  ggplot(aes(x = station, y = flow_events, fill = station)) +
+  geom_col() +
+  labs(title = "Debris flow event counts by station")
+```
+```{r}
+# PSD:  one station, first few PSD bins over time
+df_psd %>%
+  filter(station == "ILL18") %>%
+  mutate(year = year(time)) %>%
+  select(time, station, year, starts_with("value_"), `debris flow`) %>%
+  pivot_longer(cols = starts_with("value_"),
+               names_to = "frequency_bin",
+               values_to = "psd_value") %>%
+  filter(frequency_bin %in% c("value_0","value_10","value_20", "value_40", "value_60")) %>%
+  ggplot(aes(x = time, y = psd_value, color = frequency_bin)) +
+  geom_line(alpha = 0.7) +
+  geom_vline(data = df_psd %>%
+               filter(station == "ILL13", `debris flow` == 1) %>%
+               mutate(year = year(time)),
+             aes(xintercept = time),
+             color = "black", linetype = "dashed", alpha = 0.5) +
+  facet_wrap(~ year, scales = "free_x") +
+  labs(title = "PSD values over time (ILL13) with debris flow events",
+       y = "PSD value",
+       x = "Time")
+```
+
+```{r}
+# Show anomaly scores over time with debris flow events
+df_anom %>%
+  filter(station == "ILL18") %>%
+  mutate(year = year(time)) %>%
+  ggplot(aes(x = time, y = anomaly_score)) +
+  geom_line(color = "red", alpha = 0.6) +
+  geom_vline(data = df_anom %>% 
+               filter(station == "ILL16", `debris flow` == 1) %>%
+               mutate(year = year(time)),
+             aes(xintercept = time),
+             color = "blue", linetype = "dashed", alpha = 0.6) +
+  facet_wrap(~ year, scales = "free_x") +
+  labs(title = "Anomaly scores over time (ILL18) with debris flow events",
+       y = "Anomaly score (Isolation Forest)",
+       x = "Time")
+
+```
+```{r}
+# -------------------
+# Anomaly plot (ILL18)
+# -------------------
+p_anom <- df_anom %>%
+  filter(station == "ILL18") %>%
+  mutate(year = year(time)) %>%
+  ggplot(aes(x = time, y = anomaly_score)) +
+  geom_line(color = "red", alpha = 0.6) +
+  geom_vline(data = df_anom %>% 
+               filter(station == "ILL18", `debris flow` == 1) %>%
+               mutate(year = year(time)),
+             aes(xintercept = time),
+             color = "blue", linetype = "dashed", alpha = 0.6) +
+  facet_wrap(~ year, scales = "free_x") +
+  labs(title = "Anomaly scores over time (ILL16)",
+       y = "Anomaly score",
+       x = NULL)
+
+# -------------------
+# PSD plot (ILL18)
+
+p_psd <- df_psd %>%
+  filter(station == "ILL18") %>%
+  mutate(year = year(time)) %>%
+  select(time, station, year, starts_with("value_"), `debris flow`) %>%
+  pivot_longer(cols = starts_with("value_"),
+               names_to = "frequency_bin",
+               values_to = "psd_value") %>%
+  filter(frequency_bin %in% c("value_0","value_10","value_20","value_40","value_60")) %>%
+  ggplot(aes(x = time, y = psd_value, color = frequency_bin)) +
+  geom_line(alpha = 0.7) +
+  geom_vline(data = df_psd %>%
+               filter(station == "ILL18", `debris flow` == 1) %>%
+               mutate(year = year(time)),
+             aes(xintercept = time),
+             color = "black", linetype = "dashed", alpha = 0.5) +
+  facet_wrap(~ year, scales = "free_x") +
+  labs(title = "PSD values over time (ILL16)",
+       y = "PSD value",
+       x = "Time")
+
+# -------------------
+# Combine with patchwork
+
+p_anom / p_psd   # stacked layout
+```
+
+```{r}
+# for one station (ILL18)
+df_anom %>%
+  filter(station == "ILL18") %>%
+  arrange(desc(anomaly_score)) %>%
+  mutate(rank = row_number()) %>%
+  ggplot(aes(x = rank, y = anomaly_score)) +
+  geom_point(alpha = 0.6, color = "steelblue") +
+  geom_hline(yintercept = 0.7, color = "red", linetype = "dashed") +
+  labs(title = "Ranked anomaly scores (ILL18)",
+       x = "Rank (descending)",
+       y = "Anomaly score") +
+  theme_minimal()
+```
+```{r}
+# Plot only anomaly score segments > 0.7
+threshold <- 0.7
+
+df_anom %>%
+  filter(station == "ILL18") %>%
+  mutate(year = year(time),
+         anomaly_above = ifelse(anomaly_score > threshold, anomaly_score, NA)) %>%
+  ggplot(aes(x = time)) +
+  # full series in grey
+  geom_line(aes(y = anomaly_score), color = "grey60", alpha = 0.6) +
+  # highlight only above threshold in red (keeps continuity with grey)
+  geom_line(aes(y = anomaly_above), color = "red", size = 1, alpha = 0.8) +
+  # debris flow vertical lines
+  geom_vline(data = df_anom %>%
+               filter(station == "ILL16", `debris flow` == 1) %>%
+               mutate(year = year(time)),
+             aes(xintercept = time),
+             color = "blue", linetype = "dashed", alpha = 0.7) +
+  # horizontal threshold
+  geom_hline(yintercept = threshold, color = "red", linetype = "dotted") +
+  facet_wrap(~ year, scales = "free_x") +
+  labs(title = "Anomaly scores over time (ILL18) with debris flow events",
+       y = "Anomaly score (Isolation Forest)",
+       x = "Time") +
+  theme_minimal()
+```
+
+```{r}
+df_anom %>%
+  filter(station == "ILL18") %>%
+  ggplot(aes(x = std, y = anomaly_score)) +
+  geom_point(aes(color = factor(`debris flow`)), alpha = 0.6, size = 2) +
+  scale_color_manual(values = c("0" = "grey60", "1" = "blue"),
+                     labels = c("0" = "No debris flow", "1" = "Debris flow"),
+                     name = "Event") +
+  geom_hline(yintercept = 0.7, linetype = "dotted", color = "red") +
+  labs(title = "Anomaly score vs. standard deviation (ILL18)",
+       x = "Standard deviation of window",
+       y = "Anomaly score (Isolation Forest)") +
+  theme_minimal()
+```
+```{r}
+
+threshold <- 0.7
+
+# bin times into 1-minute intervals
+df_spatio <- df_anom %>%
+  mutate(station = factor(station, levels = unique(station)),
+         time_bin = floor_date(time, "1 min")) %>%
+  group_by(station, time_bin) %>%
+  summarise(anomaly_score = mean(anomaly_score, na.rm = TRUE),
+            debris_flow = any(`debris flow` == 1),
+            .groups = "drop")
+
+ggplot(df_spatio, aes(x = time_bin, y = station)) +
+  # background heatmap for anomaly scores
+  geom_tile(aes(fill = anomaly_score)) +
+  scale_fill_gradient(low = "white", high = "red") +
+  # overlay high anomaly scores as dots
+  geom_point(data = df_spatio %>% filter(anomaly_score > threshold),
+             aes(x = time_bin, y = station),
+             color = "darkred", size = 1) +
+  # debris flow vertical lines (slightly transparent)
+  geom_vline(data = df_spatio %>% filter(debris_flow),
+             aes(xintercept = time_bin),
+             color = "blue", linetype = "dashed", alpha = 0.25) +
+  labs(title = "Spatio-temporal anomaly scores with high anomalies highlighted",
+       x = "Time",
+       y = "Station",
+       fill = "Anomaly Score") +
+  theme_minimal()
+
+```
+```{r}
+anom <- read_parquet("~/Downloads/df_illgraben_anomaly_scores.parquet") |> as.data.frame()
+```
+
+```{r}
+anom <- anom[, c("station", "time", "anomaly_score")]
+
+# convert time to POSIXct
+anom$time <- as.POSIXct(anom$time, tz = "UTC")
+
+# -------------------------
+# 2. Assign station coordinates (dummy along-stream for now)
+# -------------------------
+stations <- unique(anom$station)
+
+coords <- data.frame(
+  station = stations,
+  x = seq(0, by = 100, length.out = length(stations)),  # fake along-torrent coords
+  y = 0
+)
+
+# merge into anomaly dataframe
+anom <- merge(anom, coords, by = "station")
+
+# -------------------------
+# 3. Build spatio-temporal object
+# -------------------------
+# create SpatialPoints for each row
+sp_pts <- SpatialPoints(anom[, c("x","y")], CRS("EPSG:2056"))
+
+# build spatio-temporal irregular data frame
+stf <- STIDF(sp_pts,
+             anom$time,
+             data.frame(anomaly_score = anom$anomaly_score))
+
+# -------------------------
+# 4. Variogram
+# -------------------------
+vgmST <- variogramST(anomaly_score ~ 1, data = stf,
+                     tlags = 0:6)   # try 0–6 time lags
+
+plot(vgmST, wireframe = TRUE, all = TRUE)
+
+
+
+```
+
+```{r}
+ 
+# -------------------------
+# 5. Fit covariance model
+# -------------------------
+# separable example: exponential spatial × exponential temporal
+separable_model <- vgmST("separable",
+                         space = vgm(1, "Exp", 200, 1),
+                         time  = vgm(1, "Exp", 3, 1),
+                         sill  = 1)
+
+fit <- fit.StVariogram(vgmST, separable_model)
+plot(vgmST, fit)
+
+# -------------------------
+# 6. Kriging prediction
+# -------------------------
+# new prediction grid (spatial)
+new_coords <- data.frame(x = seq(0, 700, by = 50), y = 0)
+sp_pred <- SpatialPoints(new_coords, CRS("+init=epsg:2056"))
+
+# prediction times (every 10 min)
+t_pred <- seq(min(anom$time), max(anom$time), by = "10 min")
+
+pred_grid <- STF(sp_pred, t_pred)
+
+kriged <- krigeST(anomoly_score ~ 1,
+                  data = stf,
+                  newdata = pred_grid,
+                  modelList = fit)
+
+# plot predictions
+plot(kriged, zcol = "anomoly_score")
+```
+
+```{r}
+hist(df_anom$std)
+range(df_anom$std)
+boxplot(df_anom$std)
+
+# Basic detailed histogram
+ggplot(df_anom, aes(x = std)) +
+  geom_histogram(binwidth = 5, color = "black", fill = "skyblue", alpha = 0.7) +
+  labs(title = "Histogram of standard deviation of signals",
+       x = "Standard deviation",
+       y = "Count") +
+  theme_minimal()
+```
+
+```{r}
+# Anomaly Scores by 10 Min Average
+df_agg <- df_anom_coords %>%
+  mutate(time_round = lubridate::floor_date(time, "10 minutes")) %>%
+  group_by(station, time_round) %>%
+  summarise(anomaly_mean = mean(anomaly_score, na.rm = TRUE), .groups = "drop")
+
+ggplot(df_agg, aes(x = time_round, y = anomaly_mean, color = station)) +
+  geom_line(alpha = 0.7) +
+  labs(title = "Anomaly Scores (10-min average)", 
+       x = "Date", y = "Mean Anomaly Score") +
+  theme_minimal()
+```
+
+```{r}
+# Distribution of Anomaly Scores by Station
+ggplot(df_anom_coords, aes(x = anomaly_score, fill = station)) +
+geom_histogram(bins = 30, alpha = 0.6, position = "identity") +
+labs(title = "Distribution of Anomaly Scores by Station") +
+theme_minimal()
+```
+```
+
